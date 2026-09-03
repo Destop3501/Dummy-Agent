@@ -1,0 +1,3 @@
+-qU huggingface_hub
+python-dotenv
+pydantic
