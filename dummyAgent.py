@@ -5,6 +5,7 @@ import json
 # pyrefly: ignore [missing-import]
 from huggingface_hub import InferenceClient
 from pydantic import BaseModel, Field
+import requests
 
 load_dotenv(dotenv_path=".env.local")
 
@@ -15,18 +16,12 @@ client = InferenceClient(
     model="Qwen/Qwen2.5-72B-Instruct"
 )
 
-response = client.chat.completions.create(
-    messages=[
-        {"role": "user", "content": "Are you sentient?"}
-    ],
-    max_tokens=500
-) 
-
-print(response.__dict__) 
-print()
-print(response.choices[0].message.content)
-print()
-print(response.choices[0].message.reasoning_content)
+# response = client.chat.completions.create(
+#     messages=[
+#         {"role": "user", "content": "Are you sentient?"}
+#     ],
+#     max_tokens=500
+# ) 
 
 def get_temperature(city: str):
     """
@@ -61,7 +56,7 @@ def get_temperature(city: str):
 class GetTemperatureArgs(BaseModel):
     city: str = Field(..., description="The city want to get the temperatre")
 
-schema = {
+temperature = {
     "type": "function",
     "function": {
         "name": "get_temperature",
@@ -69,24 +64,64 @@ schema = {
         "parameters": GetTemperatureArgs.model_json_schema()
     }
 }
-print(schema)
 
-response1 = client.chat.completions.create(
-    messages=[
-        {"role": "user", "content": "what is the temperature in San Francisco today?"}
-    ],
-    tools=[schema],
-    max_tokens=500,
-    tool_choice="auto"
-)
+# response1 = client.chat.completions.create(
+#     messages=[
+#         {"role": "user", "content": "what is the temperature in San Francisco today?"}
+#     ],
+#     tools=[temperature],
+#     max_tokens=500,
+#     tool_choice="auto"
+# )
 
-print(response1.__dict__) 
-print()
-print(response1.choices[0].message.content)
-print()
-print(response1.choices[0].message.reasoning_content)
-print()
-print(response1.choices[0].message.tool_calls[0].function.__dict__)
+class FetchAPIArgs(BaseModel):
+    url: str = Field(..., description="The API url to fetch JSON data from")
+
+def fetch_api_data(url: str) -> str:
+    """
+        Fetch data to this using url
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return json.dumps(response.json())
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+fetchapi = {
+    "type": "function",
+    "function": {
+        "name": "fetch_api_data",
+        "description": "Fetch data from a REST API endpoint URL",
+        "parameters": FetchAPIArgs.model_json_schema()
+    }
+}
+
+class SaveFileArgs(BaseModel):
+    data: str = Field(..., description="Sumerice content to write in a file")
+    file: str = Field("summary.md", description="The File that saved the summery")
+
+def save_the_file(data: str, file: str= "summary.md") -> str:
+    """
+        Sumerize and save in a file
+    """
+
+    try:
+        with open(file, "w", encoding="utf-8") as f:
+            f.write(data)
+        return "sucessfuly saved the summery"
+    except Exception as e:
+        return f"Error saving file {str(e)}"
+
+savefile = {
+    "type": "function",
+    "function": {
+        "name": "save_the_file",
+        "description": "sumerise the data and save in the file",
+        "parameters": SaveFileArgs.model_json_schema()
+    }
+}
 
 class Agent:
     def __init__(self, client: InferenceClient, system: str = "", tools: list = None) -> None:
@@ -165,12 +200,20 @@ client = InferenceClient(
     model="Qwen/Qwen2.5-72B-Instruct"
 )
 
-system_prompt = "You are a helpful assistant."
+system_prompt = (
+    "You are an autonomous AI agent. ALWAYS perform tasks sequentially:\n"
+    "1. First, call 'fetch_api_data' to retrieve the raw data.\n"
+    "2. Wait for the API result to return.\n"
+    "3. Summarize the returned content in your context.\n"
+    "4. Finally, call 'save_the_file' with the summarized text.\n"
+    "NEVER call 'save_the_file' in parallel with 'fetch_api_data',"
+    "calculate the temparture,"
+)
 
-tools = [schema]
+tools = [temperature, fetchapi, savefile]
 
 agent = Agent(client, system_prompt, tools)
 
-print(agent("what is the temperature of san Francisco?"))
+print(agent("Fetch data from https://jsonplaceholder.typicode.com/posts/1, summarize its key content, and save the summary to 'post_summary.md'."))
 
 print(agent.messages)
