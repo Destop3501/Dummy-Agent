@@ -2,10 +2,20 @@ import os
 import getpass
 from dotenv import load_dotenv
 import json
-# pyrefly: ignore [missing-import]
 from huggingface_hub import InferenceClient
 from pydantic import BaseModel, Field
 import requests
+import time
+
+import sys
+from pathlib import Path
+
+LOGGER_DIRECTION =  Path(__file__).resolve().parent.parent / "Logger"
+
+if str(LOGGER_DIRECTION) not in sys.path:
+    sys.path.append(str(LOGGER_DIRECTION))
+
+from logger import logger
 
 load_dotenv(dotenv_path=".env.local")
 
@@ -177,9 +187,38 @@ class Agent:
 
                     if function_name in globals() and callable(globals()[function_name]):
                         function_to_call = globals()[function_name]
-                        execute_output = function_to_call(**function_args)
-                        tool_output_contain = str(execute_output)
-                        print(f"Executing tool: {function_name} with args {function_args}, output {tool_output_contain[:500]}...")
+
+                        start_time = time.time()
+
+                        try:
+                            execute_output = function_to_call(**function_args)
+                            tool_output_contain = str(execute_output)
+
+                            latency_ms = int((time.time() - start_time) * 1000)
+                            
+                            logger.info(
+                                "Tool Execution Complete",
+                                extra = {
+                                    "tool_name": function_name,
+                                    "latency_ms": latency_ms,
+                                    "status": "success",
+                                    "output_preview": tool_output_contain[:100]
+                                }
+                            )
+                        
+                        except Exception as e:
+                            latency_ms = int((time.time() - start_time) * 1000)
+                            tool_output_contain = f"Error: {str(e)}"
+
+                            logger.error(
+                                "Tool execution failed", 
+                                extra={
+                                    "tool_name": function_name,
+                                    "latency_ms": latency_ms,
+                                    "status": "error",
+                                    "error_message": str(e)
+                                }
+                            )
 
                     tool_outputs.append(
                         {

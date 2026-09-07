@@ -3,3 +3,4 @@ python-dotenv
 pydantic
 dnspython
 requests
+python-json-logger
