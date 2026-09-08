@@ -4,3 +4,6 @@ pydantic
 dnspython
 requests
 python-json-logger
+arize-phoenix 
+opentelemetry-api 
+opentelemetry-sdk

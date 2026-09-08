@@ -1,14 +1,25 @@
+import sys
 import os
-import getpass
+from pathlib import Path
+
+# Ensure UTF-8 output encoding on Windows consoles
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
 from dotenv import load_dotenv
 import json
+import time
 from huggingface_hub import InferenceClient
 from pydantic import BaseModel, Field
 import requests
-import time
 
-import sys
-from pathlib import Path
+import phoenix as px
+from phoenix.otel import register
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 LOGGER_DIRECTION =  Path(__file__).resolve().parent.parent / "Logger"
 
@@ -17,8 +28,14 @@ if str(LOGGER_DIRECTION) not in sys.path:
 
 from logger import logger
 
-load_dotenv(dotenv_path=".env.local")
+session = px.launch_app(use_temp_dir=False)
 
+# Register Phoenix as OpenTelemetry Tracer Provider
+tracer_provider = register(project_name="default", auto_instrument=True)
+
+tracer = trace.get_tracer("customer_agent_tracer")
+
+load_dotenv(dotenv_path=".env.local")
 HF_TOKEN = os.getenv("HUGGING_FACE_API")
 
 client = InferenceClient(
@@ -32,17 +49,29 @@ client = InferenceClient(
 #     ],
 #     max_tokens=500
 # ) 
-
+@tracer.start_as_current_span("tool_get_temperature")
 def get_temperature(city: str):
     """
     Gets the temperature of a city.
     """
+    span = trace.get_current_span()
+    span.set_attribute("tool.name", "fetch_api_data")
+    span.set_attribute("tool.input.city", city)
+    
     if city.lower() == "san francisco":
+        span.set_attribute("tool.output", "75")
+        span.set_status(Status(StatusCode.OK))
         return "75"
     if city.lower() == "paris":
+        span.set_attribute("tool.output", "78")
+        span.set_status(Status(StatusCode.OK))
         return "78"
     if city.lower() == "tokyo":
+        span.set_attribute("tool.output", "80")
+        span.set_status(Status(StatusCode.OK))
         return "80"
+    span.set_attribute("tool.output", "Unknown")
+    span.set_status(Status(StatusCode.ERROR))
     return "Unknown"
 
 # get_temperature_tool_schema = {
@@ -87,16 +116,28 @@ temperature = {
 class FetchAPIArgs(BaseModel):
     url: str = Field(..., description="The API url to fetch JSON data from")
 
+@tracer.start_as_current_span("tool_fetch_api_data")
 def fetch_api_data(url: str) -> str:
     """
         Fetch data to this using url
     """
+    span = trace.get_current_span()
+    span.set_attribute("tool.name", "fetch_api_data")
+    span.set_attribute("tool.input.url", url)
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        return json.dumps(response.json())
+        data = json.dumps(response.json())
+
+        span.set_attribute("tool.output", data)
+        span.set_status(Status(StatusCode.OK))
+
+        return data
     except Exception as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, str(e)))
+
         return f"Error: {str(e)}"
 
 fetchapi = {
@@ -112,16 +153,29 @@ class SaveFileArgs(BaseModel):
     data: str = Field(..., description="Sumerice content to write in a file")
     file: str = Field("summary.md", description="The File that saved the summery")
 
+@tracer.start_as_current_span("tool_save_summery_file")
 def save_the_file(data: str, file: str= "summary.md") -> str:
     """
         Sumerize and save in a file
     """
+    span = trace.get_current_span()
+    span.set_attribute("tool.name", "save_summery_file")
+    span.set_attribute("tool.input.data", data)
+    span.set_attribute("tool.input.filename", file)
 
     try:
         with open(file, "w", encoding="utf-8") as f:
             f.write(data)
-        return "sucessfuly saved the summery"
+
+        result = "successfully saved the summery"
+        span.set_attribute("tool.output", result)
+        span.set_status(Status(StatusCode.OK))
+
+        return result
     except Exception as e:
+        span.record_exception(e)
+        span.set_status(Status(StatusCode.ERROR, str(e)))
+
         return f"Error saving file {str(e)}"
 
 savefile = {
@@ -148,91 +202,108 @@ class Agent:
             )
     
     def __call__(self, message: str = ""):
-        if message:
-            self.messages.append(
-                {
-                    "role": "user",
-                    "content": message
-                }
-            )
-        final_assistence_response = self.execute()
+        with tracer.start_as_current_span("Agent_Workflow") as root_span:
+            root_span.set_attribute("agent.user_message", message)
 
-        if final_assistence_response:
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": final_assistence_response
-                }
-            )
+            if message:
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": message
+                    }
+                )
+            final_assistence_response = self.execute()
 
-        return final_assistence_response
+            if final_assistence_response:
+                self.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": final_assistence_response
+                    }
+                )
+                root_span.set_attribute("agent.final_response", final_assistence_response)
+
+            return final_assistence_response
 
     def execute(self):
+        step_count = 0
         while True:
-            completion = self.client.chat.completions.create(
-                messages=self.messages,
-                tools=self.tools,
-                tool_choice="auto"
-            )
-            
-            response_message = completion.choices[0].message
+            step_count += 1
 
-            if response_message.tool_calls:
-                self.messages.append(response_message)
+            with tracer.start_as_current_span(f"LLM_step_{step_count}") as LLM_span:
+                LLM_span.set_attribute("LLM.Message_Count", len(self.messages))
 
-                tool_outputs = []
-                for tool_call in response_message.tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
+                completion = self.client.chat.completions.create(
+                    messages=self.messages,
+                    tools=self.tools,
+                    tool_choice="auto"
+                )
+                
+                response_message = completion.choices[0].message
 
-                    if function_name in globals() and callable(globals()[function_name]):
-                        function_to_call = globals()[function_name]
+                if response_message.tool_calls:
+                    self.messages.append(response_message)
+                    LLM_span.set_attribute("LLM.tools_calls_requested", len(response_message.tool_calls))
 
-                        start_time = time.time()
+                    tool_outputs = []
+                    for tool_call in response_message.tool_calls:
+                        function_name = tool_call.function.name
+                        function_args = json.loads(tool_call.function.arguments)
 
-                        try:
-                            execute_output = function_to_call(**function_args)
-                            tool_output_contain = str(execute_output)
+                        if function_name in globals() and callable(globals()[function_name]):
+                            function_to_call = globals()[function_name]
 
-                            latency_ms = int((time.time() - start_time) * 1000)
+                            start_time = time.time()
+
+                            try:
+                                execute_output = function_to_call(**function_args)
+                                tool_output_contain = str(execute_output)
+
+                                latency_ms = int((time.time() - start_time) * 1000)
+
+                                print("\n Logger \n\n")
+                                
+                                logger.info(
+                                    "Tool Execution Complete",
+                                    extra = {
+                                        "tool_name": function_name,
+                                        "latency_ms": latency_ms,
+                                        "status": "success",
+                                        "output_preview": tool_output_contain[:100]
+                                    }
+                                )
                             
-                            logger.info(
-                                "Tool Execution Complete",
-                                extra = {
-                                    "tool_name": function_name,
-                                    "latency_ms": latency_ms,
-                                    "status": "success",
-                                    "output_preview": tool_output_contain[:100]
-                                }
-                            )
-                        
-                        except Exception as e:
-                            latency_ms = int((time.time() - start_time) * 1000)
-                            tool_output_contain = f"Error: {str(e)}"
+                            except Exception as e:
+                                latency_ms = int((time.time() - start_time) * 1000)
+                                tool_output_contain = f"Error: {str(e)}"
 
-                            logger.error(
-                                "Tool execution failed", 
-                                extra={
-                                    "tool_name": function_name,
-                                    "latency_ms": latency_ms,
-                                    "status": "error",
-                                    "error_message": str(e)
-                                }
-                            )
+                                print("\n Logger \n\n")
 
-                    tool_outputs.append(
-                        {
-                            "tool_call_id": tool_call.id,
-                            "role": "tool",
-                            "name": function_name,
-                            "content": tool_output_contain
-                        }
-                    )
+                                logger.error(
+                                    "Tool execution failed", 
+                                    extra={
+                                        "tool_name": function_name,
+                                        "latency_ms": latency_ms,
+                                        "status": "error",
+                                        "error_message": str(e)
+                                    }
+                                )
 
-                self.messages.extend(tool_outputs)
+                        tool_outputs.append(
+                            {
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": tool_output_contain
+                            }
+                        )
 
-            else:
-                return response_message.content
+                    self.messages.extend(tool_outputs)
+
+                else:
+                    LLM_span.set_attribute("LLM.final_text_generated", True)
+
+                    return response_message.content
 
 client = InferenceClient(
     api_key=HF_TOKEN,
@@ -253,6 +324,13 @@ tools = [temperature, fetchapi, savefile]
 
 agent = Agent(client, system_prompt, tools)
 
-print(agent("Fetch data from https://jsonplaceholder.typicode.com/posts/1, summarize its key content, and save the summary to 'post_summary.md'."))
+try:
+    print(agent("Fetch data from https://jsonplaceholder.typicode.com/posts/1, summarize its key content, and save the summary to 'post_summary.md'."))
 
-print(agent.messages)
+    print("\n📊 View execution traces live in your browser at: http://localhost:6006")
+    input("Press Enter to stop tracing server...")
+
+    print()
+    print(agent.messages)
+finally:
+    px.close_app()
