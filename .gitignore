@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 dummyAgent/
 .env.local
+.vscode
 # C extensions
 *.so
 

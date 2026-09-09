@@ -70,9 +70,11 @@ def get_temperature(city: str):
         span.set_attribute("tool.output", "80")
         span.set_status(Status(StatusCode.OK))
         return "80"
-    span.set_attribute("tool.output", "Unknown")
+
+    error_message = f"Unknown city: {city}"
+    span.set_attribute("failure.mode", "ToolExcicutionError")
     span.set_status(Status(StatusCode.ERROR))
-    return "Unknown"
+    return error_message
 
 # get_temperature_tool_schema = {
 #     "type" : "function",
@@ -130,12 +132,13 @@ def fetch_api_data(url: str) -> str:
         response.raise_for_status()
         data = json.dumps(response.json())
 
-        span.set_attribute("tool.output", data)
+        span.set_attribute("tool.output", data[:200])
         span.set_status(Status(StatusCode.OK))
 
         return data
     except Exception as e:
         span.record_exception(e)
+        span.set_attribute("failure.mode", "ToolExecutionError")
         span.set_status(Status(StatusCode.ERROR, str(e)))
 
         return f"Error: {str(e)}"
@@ -160,7 +163,7 @@ def save_the_file(data: str, file: str= "summary.md") -> str:
     """
     span = trace.get_current_span()
     span.set_attribute("tool.name", "save_summery_file")
-    span.set_attribute("tool.input.data", data)
+    span.set_attribute("tool.input.data", data[:200])
     span.set_attribute("tool.input.filename", file)
 
     try:
@@ -174,6 +177,7 @@ def save_the_file(data: str, file: str= "summary.md") -> str:
         return result
     except Exception as e:
         span.record_exception(e)
+        span.set_attribute("failure.mode", "ToolExecutionError")
         span.set_status(Status(StatusCode.ERROR, str(e)))
 
         return f"Error saving file {str(e)}"
@@ -188,11 +192,12 @@ savefile = {
 }
 
 class Agent:
-    def __init__(self, client: InferenceClient, system: str = "", tools: list = None) -> None:
+    def __init__(self, client: InferenceClient, system: str = "", tools: list = None, max_turns: int = 5) -> None:
         self.client = client
         self.system = system
         self.messages: list = []
         self.tools = tools if tools is not None else []
+        self.max_turns = max_turns
         if self.system:
             self.messages.append(
                 {
@@ -230,6 +235,15 @@ class Agent:
         while True:
             step_count += 1
 
+            if step_count > self.max_turns:
+                with tracer.start_as_current_span("Failure_Infinite_Loop") as loop_span:
+                    err_msg = f"Agent exceeded maximum allowed turns limit of {self.max_turns}"
+                    loop_span.set_attribute("failure.mode", "InfiniteLoopError")
+                    loop_span.set_attribute("turns_count", step_count)
+                    loop_span.set_status(Status(StatusCode.ERROR, err_msg))
+                    logger.error(err_msg, extra={"status": "error", "failure_mode": "InfiniteLoopError"})
+                    return f"Error: {err_msg}"
+
             with tracer.start_as_current_span(f"LLM_step_{step_count}") as LLM_span:
                 LLM_span.set_attribute("LLM.Message_Count", len(self.messages))
 
@@ -248,7 +262,42 @@ class Agent:
                     tool_outputs = []
                     for tool_call in response_message.tool_calls:
                         function_name = tool_call.function.name
-                        function_args = json.loads(tool_call.function.arguments)
+                        raw_arguments = tool_call.function.arguments
+                        try:
+                            function_args = json.loads(raw_arguments)
+                        except json.JSONDecodeError as json_err:
+                            with tracer.start_as_current_span("Failure_FormatError") as format_span:
+                                format_span.record_exception(json_err)
+                                format_span.set_attribute("failure.mode", "FormatError")
+                                format_span.set_attribute("raw_arguments", raw_arguments)
+                                format_span.set_status(Status(StatusCode.ERROR, "Malformed JSON arguments returned by LLM"))
+                                
+                                logger.error("JSON decode error", extra={"raw_args": raw_arguments})
+
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": f"Error: Arguments must be valid JSON string. Provided: {raw_arguments}"
+                            })
+                            continue
+
+                        if "{{" in raw_arguments or "}}" in raw_arguments:
+                            with tracer.start_as_current_span("Failure_SilentTemplateError") as template_span:
+                                template_err = "LLM generated unparsed placeholder variables like '{{...}}' instead of concrete data"
+                                template_span.set_attribute("failure.mode", "SilentValidationError")
+                                template_span.set_attribute("invalid_arguments", raw_arguments)
+                                template_span.set_status(Status(StatusCode.ERROR, template_err))
+                                
+                                logger.warning("Template hallucination detected", extra={"args": raw_arguments})
+
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": f"Error: Silent template validation error. Placeholder syntax '{{...}}' is not permitted in tool arguments: {raw_arguments}"
+                            })
+                            continue
 
                         if function_name in globals() and callable(globals()[function_name]):
                             function_to_call = globals()[function_name]
@@ -276,6 +325,11 @@ class Agent:
                             except Exception as e:
                                 latency_ms = int((time.time() - start_time) * 1000)
                                 tool_output_contain = f"Error: {str(e)}"
+
+                                with tracer.start_as_current_span("Failure_ToolExecution") as tool_err_span:
+                                    tool_err_span.record_exception(e)
+                                    tool_err_span.set_attribute("failure.mode", "ToolExecutionError")
+                                    tool_err_span.set_status(Status(StatusCode.ERROR, str(e)))
 
                                 print("\n Logger \n\n")
 
@@ -305,11 +359,6 @@ class Agent:
 
                     return response_message.content
 
-client = InferenceClient(
-    api_key=HF_TOKEN,
-    model="Qwen/Qwen2.5-72B-Instruct"
-)
-
 system_prompt = (
     "You are an autonomous AI agent. ALWAYS perform tasks sequentially:\n"
     "1. First, call 'fetch_api_data' to retrieve the raw data.\n"
@@ -322,15 +371,16 @@ system_prompt = (
 
 tools = [temperature, fetchapi, savefile]
 
-agent = Agent(client, system_prompt, tools)
+agent = Agent(client, system_prompt, tools, max_turns=5)
 
-try:
-    print(agent("Fetch data from https://jsonplaceholder.typicode.com/posts/1, summarize its key content, and save the summary to 'post_summary.md'."))
+if __name__ == "__main__":
+    try:
+        print(agent("Fetch data from https://jsonplaceholder.typicode.com/posts/1, summarize its key content, and save the summary to 'post_summary.md'."))
 
-    print("\n📊 View execution traces live in your browser at: http://localhost:6006")
-    input("Press Enter to stop tracing server...")
+        print("\n📊 View execution traces live in your browser at: http://localhost:6006")
+        input("Press Enter to stop tracing server...")
 
-    print()
-    print(agent.messages)
-finally:
-    px.close_app()
+        print()
+        print(agent.messages)
+    finally:
+        px.close_app()
