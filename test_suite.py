@@ -21,7 +21,7 @@ if __name__ == "__main__":
         choice = input("Select test mode (1-4): ").strip()
 
         if choice == "1":
-            print(agent("Fetch data from https://jsonplaceholder.typicode.com/nonexistent_page_404, summarize it, and save to 'fail.md'."))
+            print(agent("Fetch data from https://jsonplaceholder.typicode.com/nonexistent_page_404, summarize it, and save to 'fail_getter.md'."))
         elif choice == "2":
             print(agent("Save the raw unparsed template string '{{fetch_api_data.output.body}}' into 'template.md' using save_the_file tool."))
         elif choice == "3":
