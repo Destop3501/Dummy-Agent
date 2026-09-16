@@ -99,11 +99,12 @@ To test error handling, placeholder rejection, and loop limits:
 python test_suite.py
 ```
 
-Select a test mode from the prompt:
+Select a test mode from the interactive prompt (runs repeatedly until you type `q`):
 - **`1` - Tool Execution Failure**: Simulates a 404 REST API endpoint call.
 - **`2` - Silent Template Error**: Tests detection and blocking of `{{fetch_api_data.output.body}}` template syntax.
 - **`3` - Infinite Loop Error**: Tests `max_turns` limit safeguard.
 - **`4` - Unknown City Tool Error**: Tests validation inside domain-specific tools.
+- **`q` - Quit**: Exits the test suite and stops the Phoenix tracing server.
 
 ---
 

@@ -63,26 +63,35 @@ def get_temperature(city: str):
     Gets the temperature of a city.
     """
     span = trace.get_current_span()
-    span.set_attribute("tool.name", "fetch_api_data")
+    span.set_attribute("openinference.span.kind", "TOOL")
+    span.set_attribute("tool.name", "get_temperature")
     span.set_attribute("tool.input.city", city)
+    span.set_attribute("input.value", json.dumps({"city": city}))
     
     if city.lower() == "san francisco":
+        span.set_attribute("output.value", "75")
         span.set_attribute("tool.output", "75")
         span.set_status(Status(StatusCode.OK))
         return "75"
     if city.lower() == "paris":
+        span.set_attribute("output.value", "78")
         span.set_attribute("tool.output", "78")
         span.set_status(Status(StatusCode.OK))
         return "78"
     if city.lower() == "tokyo":
+        span.set_attribute("output.value", "80")
         span.set_attribute("tool.output", "80")
         span.set_status(Status(StatusCode.OK))
         return "80"
 
     error_message = f"Unknown city: {city}"
-    span.set_attribute("failure.mode", "ToolExcicutionError")
-    span.set_status(Status(StatusCode.ERROR))
-    return error_message
+    span.record_exception(ValueError(error_message))
+    span.set_attribute("failure.mode", "ToolExecutionError")
+    span.set_attribute("error", True)
+    span.set_attribute("error.message", error_message)
+    span.set_attribute("output.value", f"Error: {error_message}")
+    span.set_status(Status(StatusCode.ERROR, error_message))
+    return f"Error: {error_message}"
 
 # get_temperature_tool_schema = {
 #     "type" : "function",
@@ -132,14 +141,17 @@ def fetch_api_data(url: str) -> str:
         Fetch data to this using url
     """
     span = trace.get_current_span()
+    span.set_attribute("openinference.span.kind", "TOOL")
     span.set_attribute("tool.name", "fetch_api_data")
     span.set_attribute("tool.input.url", url)
+    span.set_attribute("input.value", json.dumps({"url": url}))
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = json.dumps(response.json())
 
+        span.set_attribute("output.value", data[:200])
         span.set_attribute("tool.output", data[:200])
         span.set_status(Status(StatusCode.OK))
 
@@ -147,6 +159,9 @@ def fetch_api_data(url: str) -> str:
     except Exception as e:
         span.record_exception(e)
         span.set_attribute("failure.mode", "ToolExecutionError")
+        span.set_attribute("error", True)
+        span.set_attribute("error.message", str(e))
+        span.set_attribute("output.value", f"Error: {str(e)}")
         span.set_status(Status(StatusCode.ERROR, str(e)))
 
         return f"Error: {str(e)}"
@@ -170,15 +185,18 @@ def save_the_file(data: str, file: str= "summary.md") -> str:
         Summarize and save in a file
     """
     span = trace.get_current_span()
+    span.set_attribute("openinference.span.kind", "TOOL")
     span.set_attribute("tool.name", "save_summery_file")
     span.set_attribute("tool.input.data", data[:200])
     span.set_attribute("tool.input.filename", file)
+    span.set_attribute("input.value", json.dumps({"data": data[:200], "file": file}))
 
     try:
         with open(file, "w", encoding="utf-8") as f:
             f.write(data)
 
         result = "successfully saved the summery"
+        span.set_attribute("output.value", result)
         span.set_attribute("tool.output", result)
         span.set_status(Status(StatusCode.OK))
 
@@ -186,6 +204,9 @@ def save_the_file(data: str, file: str= "summary.md") -> str:
     except Exception as e:
         span.record_exception(e)
         span.set_attribute("failure.mode", "ToolExecutionError")
+        span.set_attribute("error", True)
+        span.set_attribute("error.message", str(e))
+        span.set_attribute("output.value", f"Error saving file {str(e)}")
         span.set_status(Status(StatusCode.ERROR, str(e)))
 
         return f"Error saving file {str(e)}"
@@ -206,6 +227,9 @@ class Agent:
         self.messages: list = []
         self.tools = tools if tools is not None else []
         self.max_turns = max_turns
+        self.had_error: bool = False
+        self.last_error_message: str = ""
+        self.last_error_mode: str = ""
         if self.system:
             self.messages.append(
                 {
@@ -215,7 +239,13 @@ class Agent:
             )
     
     def __call__(self, message: str = ""):
+        self.had_error = False
+        self.last_error_message = ""
+        self.last_error_mode = ""
+
         with tracer.start_as_current_span("Agent_Workflow") as root_span:
+            root_span.set_attribute("openinference.span.kind", "AGENT")
+            root_span.set_attribute("input.value", message)
             root_span.set_attribute("agent.user_message", message)
 
             if message:
@@ -234,7 +264,19 @@ class Agent:
                         "content": final_assistence_response
                     }
                 )
+                root_span.set_attribute("output.value", str(final_assistence_response))
                 root_span.set_attribute("agent.final_response", final_assistence_response)
+
+            if self.had_error or (final_assistence_response and str(final_assistence_response).startswith("Error:")):
+                err_text = self.last_error_message or str(final_assistence_response)
+                root_span.record_exception(RuntimeError(err_text))
+                root_span.set_status(Status(StatusCode.ERROR, err_text))
+                root_span.set_attribute("error", True)
+                root_span.set_attribute("error.message", err_text)
+                if self.last_error_mode:
+                    root_span.set_attribute("failure.mode", self.last_error_mode)
+            else:
+                root_span.set_status(Status(StatusCode.OK))
 
             return final_assistence_response
 
@@ -244,15 +286,23 @@ class Agent:
             step_count += 1
 
             if step_count > self.max_turns:
+                err_msg = f"Agent exceeded maximum allowed turns limit of {self.max_turns}"
+                self.had_error = True
+                self.last_error_message = err_msg
+                self.last_error_mode = "InfiniteLoopError"
                 with tracer.start_as_current_span("Failure_Infinite_Loop") as loop_span:
-                    err_msg = f"Agent exceeded maximum allowed turns limit of {self.max_turns}"
+                    loop_span.set_attribute("openinference.span.kind", "CHAIN")
+                    loop_span.record_exception(RuntimeError(err_msg))
                     loop_span.set_attribute("failure.mode", "InfiniteLoopError")
                     loop_span.set_attribute("turns_count", step_count)
+                    loop_span.set_attribute("error", True)
+                    loop_span.set_attribute("error.message", err_msg)
                     loop_span.set_status(Status(StatusCode.ERROR, err_msg))
-                    logger.error(err_msg, extra={"status": "error", "failure_mode": "InfiniteLoopError"})
-                    return f"Error: {err_msg}"
+                logger.error(err_msg, extra={"status": "error", "failure_mode": "InfiniteLoopError"})
+                return f"Error: {err_msg}"
 
             with tracer.start_as_current_span(f"LLM_step_{step_count}") as LLM_span:
+                LLM_span.set_attribute("openinference.span.kind", "LLM")
                 LLM_span.set_attribute("LLM.Message_Count", len(self.messages))
 
                 completion = self.client.chat.completions.create(
@@ -274,13 +324,23 @@ class Agent:
                         try:
                             function_args = json.loads(raw_arguments)
                         except json.JSONDecodeError as json_err:
+                            err_msg = f"Malformed JSON arguments returned by LLM: {raw_arguments}"
+                            self.had_error = True
+                            self.last_error_message = err_msg
+                            self.last_error_mode = "FormatError"
                             with tracer.start_as_current_span("Failure_FormatError") as format_span:
+                                format_span.set_attribute("openinference.span.kind", "CHAIN")
                                 format_span.record_exception(json_err)
                                 format_span.set_attribute("failure.mode", "FormatError")
                                 format_span.set_attribute("raw_arguments", raw_arguments)
-                                format_span.set_status(Status(StatusCode.ERROR, "Malformed JSON arguments returned by LLM"))
-                                
-                                logger.error("JSON decode error", extra={"raw_args": raw_arguments})
+                                format_span.set_attribute("error", True)
+                                format_span.set_attribute("error.message", str(json_err))
+                                format_span.set_status(Status(StatusCode.ERROR, err_msg))
+                            LLM_span.record_exception(json_err)
+                            LLM_span.set_status(Status(StatusCode.ERROR, err_msg))
+                            LLM_span.set_attribute("error", True)
+                            LLM_span.set_attribute("error.message", str(json_err))
+                            logger.error("JSON decode error", extra={"raw_args": raw_arguments})
 
                             tool_outputs.append({
                                 "tool_call_id": tool_call.id,
@@ -291,13 +351,23 @@ class Agent:
                             continue
 
                         if "{{" in raw_arguments or "}}" in raw_arguments:
+                            template_err = f"Silent template error. Placeholder syntax in tool arguments: {raw_arguments}"
+                            self.had_error = True
+                            self.last_error_message = template_err
+                            self.last_error_mode = "SilentValidationError"
                             with tracer.start_as_current_span("Failure_SilentTemplateError") as template_span:
-                                template_err = "LLM generated unparsed placeholder variables like '{{...}}' instead of concrete data"
+                                template_span.set_attribute("openinference.span.kind", "CHAIN")
+                                template_span.record_exception(ValueError(template_err))
                                 template_span.set_attribute("failure.mode", "SilentValidationError")
                                 template_span.set_attribute("invalid_arguments", raw_arguments)
+                                template_span.set_attribute("error", True)
+                                template_span.set_attribute("error.message", template_err)
                                 template_span.set_status(Status(StatusCode.ERROR, template_err))
-                                
-                                logger.warning("Template hallucination detected", extra={"args": raw_arguments})
+                            LLM_span.record_exception(ValueError(template_err))
+                            LLM_span.set_status(Status(StatusCode.ERROR, template_err))
+                            LLM_span.set_attribute("error", True)
+                            LLM_span.set_attribute("error.message", template_err)
+                            logger.warning("Template hallucination detected", extra={"template_args": raw_arguments})
 
                             tool_outputs.append({
                                 "tool_call_id": tool_call.id,
@@ -325,19 +395,38 @@ class Agent:
                                     extra = {
                                         "tool_name": function_name,
                                         "latency_ms": latency_ms,
-                                        "status": "success",
+                                        "status": "success" if not tool_output_contain.startswith("Error:") else "error",
                                         "output_preview": tool_output_contain[:100]
                                     }
                                 )
+
+                                if tool_output_contain.startswith("Error:"):
+                                    self.had_error = True
+                                    self.last_error_message = tool_output_contain
+                                    self.last_error_mode = "ToolExecutionError"
+                                    LLM_span.record_exception(ValueError(tool_output_contain))
+                                    LLM_span.set_status(Status(StatusCode.ERROR, tool_output_contain))
+                                    LLM_span.set_attribute("error", True)
+                                    LLM_span.set_attribute("error.message", tool_output_contain)
                             
                             except Exception as e:
                                 latency_ms = int((time.time() - start_time) * 1000)
                                 tool_output_contain = f"Error: {str(e)}"
+                                self.had_error = True
+                                self.last_error_message = str(e)
+                                self.last_error_mode = "ToolExecutionError"
 
                                 with tracer.start_as_current_span("Failure_ToolExecution") as tool_err_span:
+                                    tool_err_span.set_attribute("openinference.span.kind", "CHAIN")
                                     tool_err_span.record_exception(e)
                                     tool_err_span.set_attribute("failure.mode", "ToolExecutionError")
+                                    tool_err_span.set_attribute("error", True)
+                                    tool_err_span.set_attribute("error.message", str(e))
                                     tool_err_span.set_status(Status(StatusCode.ERROR, str(e)))
+                                LLM_span.record_exception(e)
+                                LLM_span.set_status(Status(StatusCode.ERROR, str(e)))
+                                LLM_span.set_attribute("error", True)
+                                LLM_span.set_attribute("error.message", str(e))
 
                                 print("\n Logger \n\n")
 
@@ -364,6 +453,9 @@ class Agent:
 
                 else:
                     LLM_span.set_attribute("LLM.final_text_generated", True)
+                    LLM_span.set_attribute("output.value", str(response_message.content))
+                    if not self.had_error:
+                        LLM_span.set_status(Status(StatusCode.OK))
 
                     return response_message.content
 
