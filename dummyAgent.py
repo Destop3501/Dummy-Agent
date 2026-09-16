@@ -9,16 +9,23 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 import json
 import time
+# pyrefly: ignore [missing-import]
 from huggingface_hub import InferenceClient
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel, Field
 import requests
 
+# pyrefly: ignore [missing-import]
 import phoenix as px
+# pyrefly: ignore [missing-import]
 from phoenix.otel import register
+# pyrefly: ignore [missing-import]
 from opentelemetry import trace
+# pyrefly: ignore [missing-import]
 from opentelemetry.trace import Status, StatusCode
 
 LOGGER_DIRECTION =  Path(__file__).resolve().parent.parent / "Logger"
@@ -26,6 +33,7 @@ LOGGER_DIRECTION =  Path(__file__).resolve().parent.parent / "Logger"
 if str(LOGGER_DIRECTION) not in sys.path:
     sys.path.append(str(LOGGER_DIRECTION))
 
+# pyrefly: ignore [missing-import]
 from logger import logger
 
 session = px.launch_app(use_temp_dir=False)
@@ -153,13 +161,13 @@ fetchapi = {
 }
 
 class SaveFileArgs(BaseModel):
-    data: str = Field(..., description="Sumerice content to write in a file")
-    file: str = Field("summary.md", description="The File that saved the summery")
+    data: str = Field(..., description="Summarized content to write to a file")
+    file: str = Field("summary.md", description="The path of the file to save the summary to")
 
 @tracer.start_as_current_span("tool_save_summery_file")
 def save_the_file(data: str, file: str= "summary.md") -> str:
     """
-        Sumerize and save in a file
+        Summarize and save in a file
     """
     span = trace.get_current_span()
     span.set_attribute("tool.name", "save_summery_file")
@@ -186,7 +194,7 @@ savefile = {
     "type": "function",
     "function": {
         "name": "save_the_file",
-        "description": "sumerise the data and save in the file",
+        "description": "Save summarized content to a file",
         "parameters": SaveFileArgs.model_json_schema()
     }
 }
@@ -360,13 +368,17 @@ class Agent:
                     return response_message.content
 
 system_prompt = (
-    "You are an autonomous AI agent. ALWAYS perform tasks sequentially:\n"
-    "1. First, call 'fetch_api_data' to retrieve the raw data.\n"
-    "2. Wait for the API result to return.\n"
-    "3. Summarize the returned content in your context.\n"
-    "4. Finally, call 'save_the_file' with the summarized text.\n"
-    "NEVER call 'save_the_file' in parallel with 'fetch_api_data',"
-    "calculate the temparture,"
+    "You are an autonomous AI assistant capable of executing tools to accomplish tasks.\n\n"
+    "Rules:\n"
+    "1. Always solve the user request step-by-step using the provided tools.\n"
+    "2. Sequential Workflow:\n"
+    "   - Step 1: Call 'fetch_api_data' with the target URL to obtain raw JSON data.\n"
+    "   - Step 2: Once the tool returns data, summarize the key findings in your reasoning.\n"
+    "   - Step 3: Call 'save_the_file' with the summarized text and target filename.\n"
+    "   - Step 4: When information is complete, provide a final concise confirmation message to the user.\n"
+    "3. CRITICAL: Never generate placeholder templates like '{{variable}}' in tool arguments. All tool arguments must be concrete values.\n"
+    "4. Do not call 'save_the_file' before 'fetch_api_data' returns data.\n"
+    "5. If a tool returns an error, examine the error message and attempt an alternative or report the issue clearly."
 )
 
 tools = [temperature, fetchapi, savefile]
