@@ -37,7 +37,6 @@ from logger import logger
 
 session = px.launch_app(use_temp_dir=False)
 
-# Register Phoenix as OpenTelemetry Tracer Provider
 tracer_provider = register(project_name="default", auto_instrument=True)
 
 tracer = trace.get_tracer("customer_agent_tracer")
