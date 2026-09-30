@@ -2,7 +2,6 @@ import sys
 import os
 from pathlib import Path
 
-# Ensure UTF-8 output encoding on Windows consoles
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
