@@ -34,6 +34,7 @@ if str(LOGGER_DIRECTION) not in sys.path:
 
 # pyrefly: ignore [missing-import]
 from logger import logger
+from self_healing import HealthObserver, RemediationExecutor
 
 session = px.launch_app(use_temp_dir=False)
 
@@ -41,13 +42,16 @@ tracer_provider = register(project_name="default", auto_instrument=True)
 
 tracer = trace.get_tracer("customer_agent_tracer")
 
+from self_healing.llm_fallback import ResilientInferenceClient
+
 load_dotenv(dotenv_path=".env.local")
 HF_TOKEN = os.getenv("HUGGING_FACE_API")
 
-client = InferenceClient(
+raw_client = InferenceClient(
     api_key=HF_TOKEN,
     model="Qwen/Qwen2.5-72B-Instruct"
 )
+client = ResilientInferenceClient(raw_client)
 
 # response = client.chat.completions.create(
 #     messages=[
@@ -219,15 +223,27 @@ savefile = {
 }
 
 class Agent:
-    def __init__(self, client: InferenceClient, system: str = "", tools: list = None, max_turns: int = 5) -> None:
+    def __init__(
+        self,
+        client: InferenceClient,
+        system: str = "",
+        tools: list = None,
+        max_turns: int = 5,
+        self_healing: bool = True,
+    ) -> None:
         self.client = client
         self.system = system
         self.messages: list = []
         self.tools = tools if tools is not None else []
         self.max_turns = max_turns
+        self.self_healing = self_healing
+        self.observer = HealthObserver(repeat_threshold=2)
+        self.remediation = RemediationExecutor(self.observer)
         self.had_error: bool = False
+        self.is_healed: bool = False
         self.last_error_message: str = ""
         self.last_error_mode: str = ""
+        self.healing_log: list = []
         if self.system:
             self.messages.append(
                 {
@@ -238,13 +254,18 @@ class Agent:
     
     def __call__(self, message: str = ""):
         self.had_error = False
+        self.is_healed = False
         self.last_error_message = ""
         self.last_error_mode = ""
+        self.healing_log = []
+        self.observer = HealthObserver(repeat_threshold=2)
+        self.remediation = RemediationExecutor(self.observer)
 
         with tracer.start_as_current_span("Agent_Workflow") as root_span:
             root_span.set_attribute("openinference.span.kind", "AGENT")
             root_span.set_attribute("input.value", message)
             root_span.set_attribute("agent.user_message", message)
+            root_span.set_attribute("agent.self_healing_enabled", self.self_healing)
 
             if message:
                 self.messages.append(
@@ -265,7 +286,12 @@ class Agent:
                 root_span.set_attribute("output.value", str(final_assistence_response))
                 root_span.set_attribute("agent.final_response", final_assistence_response)
 
-            if self.had_error or (final_assistence_response and str(final_assistence_response).startswith("Error:")):
+            if self.is_healed:
+                root_span.set_attribute("agent.self_healed", True)
+                root_span.set_attribute("healing.count", len(self.healing_log))
+                root_span.set_attribute("healing.summary", "; ".join(self.healing_log))
+
+            if (self.had_error and not self.is_healed) or (final_assistence_response and str(final_assistence_response).startswith("Error:") and not self.is_healed):
                 err_text = self.last_error_message or str(final_assistence_response)
                 root_span.record_exception(RuntimeError(err_text))
                 root_span.set_status(Status(StatusCode.ERROR, err_text))
@@ -319,140 +345,175 @@ class Agent:
                     for tool_call in response_message.tool_calls:
                         function_name = tool_call.function.name
                         raw_arguments = tool_call.function.arguments
-                        try:
-                            function_args = json.loads(raw_arguments)
-                        except json.JSONDecodeError as json_err:
-                            err_msg = f"Malformed JSON arguments returned by LLM: {raw_arguments}"
-                            self.had_error = True
-                            self.last_error_message = err_msg
-                            self.last_error_mode = "FormatError"
-                            with tracer.start_as_current_span("Failure_FormatError") as format_span:
-                                format_span.set_attribute("openinference.span.kind", "CHAIN")
-                                format_span.record_exception(json_err)
-                                format_span.set_attribute("failure.mode", "FormatError")
-                                format_span.set_attribute("raw_arguments", raw_arguments)
-                                format_span.set_attribute("error", True)
-                                format_span.set_attribute("error.message", str(json_err))
-                                format_span.set_status(Status(StatusCode.ERROR, err_msg))
-                            LLM_span.record_exception(json_err)
-                            LLM_span.set_status(Status(StatusCode.ERROR, err_msg))
-                            LLM_span.set_attribute("error", True)
-                            LLM_span.set_attribute("error.message", str(json_err))
-                            logger.error("JSON decode error", extra={"raw_args": raw_arguments})
 
-                            tool_outputs.append({
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "name": function_name,
-                                "content": f"Error: Arguments must be valid JSON string. Provided: {raw_arguments}"
-                            })
-                            continue
+                        # 1. Observe arguments for syntax and template anomalies
+                        arg_event = self.observer.observe_arguments(function_name, raw_arguments)
+                        function_args = None
 
-                        if "{{" in raw_arguments or "}}" in raw_arguments:
-                            template_err = f"Silent template error. Placeholder syntax in tool arguments: {raw_arguments}"
-                            self.had_error = True
-                            self.last_error_message = template_err
-                            self.last_error_mode = "SilentValidationError"
-                            with tracer.start_as_current_span("Failure_SilentTemplateError") as template_span:
-                                template_span.set_attribute("openinference.span.kind", "CHAIN")
-                                template_span.record_exception(ValueError(template_err))
-                                template_span.set_attribute("failure.mode", "SilentValidationError")
-                                template_span.set_attribute("invalid_arguments", raw_arguments)
-                                template_span.set_attribute("error", True)
-                                template_span.set_attribute("error.message", template_err)
-                                template_span.set_status(Status(StatusCode.ERROR, template_err))
-                            LLM_span.record_exception(ValueError(template_err))
-                            LLM_span.set_status(Status(StatusCode.ERROR, template_err))
-                            LLM_span.set_attribute("error", True)
-                            LLM_span.set_attribute("error.message", template_err)
-                            logger.warning("Template hallucination detected", extra={"template_args": raw_arguments})
+                        if arg_event.is_anomaly:
+                            if self.self_healing:
+                                healed, repaired_args, notes = self.remediation.heal_arguments(arg_event, self.messages)
+                                if healed:
+                                    function_args = repaired_args
+                                    self.is_healed = True
+                                    self.healing_log.append(f"Argument healed: {notes}")
+                                    logger.info(f"Self-Healing argument remediation: {notes}")
 
-                            tool_outputs.append({
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "name": function_name,
-                                "content": f"Error: Silent template validation error. Placeholder syntax '{{...}}' is not permitted in tool arguments: {raw_arguments}"
-                            })
-                            continue
+                            if function_args is None:
+                                # Fallback to unhealed failure behavior
+                                if arg_event.error_mode == "FormatError":
+                                    err_msg = f"Malformed JSON arguments returned by LLM: {raw_arguments}"
+                                    self.had_error = True
+                                    self.last_error_message = err_msg
+                                    self.last_error_mode = "FormatError"
+                                    with tracer.start_as_current_span("Failure_FormatError") as format_span:
+                                        format_span.set_attribute("openinference.span.kind", "CHAIN")
+                                        format_span.record_exception(ValueError(err_msg))
+                                        format_span.set_attribute("failure.mode", "FormatError")
+                                        format_span.set_attribute("raw_arguments", raw_arguments)
+                                        format_span.set_attribute("error", True)
+                                        format_span.set_attribute("error.message", err_msg)
+                                        format_span.set_status(Status(StatusCode.ERROR, err_msg))
+                                    LLM_span.record_exception(ValueError(err_msg))
+                                    LLM_span.set_status(Status(StatusCode.ERROR, err_msg))
+                                    LLM_span.set_attribute("error", True)
+                                    LLM_span.set_attribute("error.message", err_msg)
+                                    logger.error("JSON decode error", extra={"raw_args": raw_arguments})
 
+                                    tool_outputs.append({
+                                        "tool_call_id": tool_call.id,
+                                        "role": "tool",
+                                        "name": function_name,
+                                        "content": f"Error: Arguments must be valid JSON string. Provided: {raw_arguments}"
+                                    })
+                                    continue
+
+                                elif arg_event.error_mode == "SilentValidationError":
+                                    template_err = f"Silent template error. Placeholder syntax in tool arguments: {raw_arguments}"
+                                    self.had_error = True
+                                    self.last_error_message = template_err
+                                    self.last_error_mode = "SilentValidationError"
+                                    with tracer.start_as_current_span("Failure_SilentTemplateError") as template_span:
+                                        template_span.set_attribute("openinference.span.kind", "CHAIN")
+                                        template_span.record_exception(ValueError(template_err))
+                                        template_span.set_attribute("failure.mode", "SilentValidationError")
+                                        template_span.set_attribute("invalid_arguments", raw_arguments)
+                                        template_span.set_attribute("error", True)
+                                        template_span.set_attribute("error.message", template_err)
+                                        template_span.set_status(Status(StatusCode.ERROR, template_err))
+                                    LLM_span.record_exception(ValueError(template_err))
+                                    LLM_span.set_status(Status(StatusCode.ERROR, template_err))
+                                    LLM_span.set_attribute("error", True)
+                                    LLM_span.set_attribute("error.message", template_err)
+                                    logger.warning("Template hallucination detected", extra={"template_args": raw_arguments})
+
+                                    tool_outputs.append({
+                                        "tool_call_id": tool_call.id,
+                                        "role": "tool",
+                                        "name": function_name,
+                                        "content": f"Error: Silent template validation error. Placeholder syntax '{{...}}' is not permitted in tool arguments: {raw_arguments}"
+                                    })
+                                    continue
+                        else:
+                            function_args = arg_event.parsed_input
+
+                        # 2. Execute tool
                         if function_name in globals() and callable(globals()[function_name]):
                             function_to_call = globals()[function_name]
-
                             start_time = time.time()
+                            execution_failed = False
+                            tool_output_contain = ""
 
                             try:
                                 execute_output = function_to_call(**function_args)
                                 tool_output_contain = str(execute_output)
-
-                                latency_ms = int((time.time() - start_time) * 1000)
-
-                                print("\n Logger \n\n")
-                                
-                                logger.info(
-                                    "Tool Execution Complete",
-                                    extra = {
-                                        "tool_name": function_name,
-                                        "latency_ms": latency_ms,
-                                        "status": "success" if not tool_output_contain.startswith("Error:") else "error",
-                                        "output_preview": tool_output_contain[:100]
-                                    }
-                                )
-
                                 if tool_output_contain.startswith("Error:"):
+                                    execution_failed = True
+                            except Exception as e:
+                                execution_failed = True
+                                tool_output_contain = f"Error: {str(e)}"
+
+                            # Record execution in health observer
+                            obs_event = self.observer.observe_tool_execution(
+                                function_name, function_args, tool_output_contain
+                            )
+
+                            # 3. Intercept & Self-Heal Tool Failures
+                            if execution_failed:
+                                if self.self_healing and obs_event.is_anomaly:
+                                    healed, healed_output, repair_notes = self.remediation.heal_tool_execution(obs_event)
+                                    if healed:
+                                        tool_output_contain = healed_output
+                                        self.is_healed = True
+                                        self.healing_log.append(f"Tool healed: {repair_notes}")
+                                        logger.info(f"Self-Healing tool execution remediation applied: {repair_notes}")
+                                        execution_failed = False
+
+                                if execution_failed:
+                                    # Record unhealed failure
                                     self.had_error = True
                                     self.last_error_message = tool_output_contain
                                     self.last_error_mode = "ToolExecutionError"
+
+                                    with tracer.start_as_current_span("Failure_ToolExecution") as tool_err_span:
+                                        tool_err_span.set_attribute("openinference.span.kind", "CHAIN")
+                                        tool_err_span.record_exception(ValueError(tool_output_contain))
+                                        tool_err_span.set_attribute("failure.mode", "ToolExecutionError")
+                                        tool_err_span.set_attribute("error", True)
+                                        tool_err_span.set_attribute("error.message", tool_output_contain)
+                                        tool_err_span.set_status(Status(StatusCode.ERROR, tool_output_contain))
                                     LLM_span.record_exception(ValueError(tool_output_contain))
                                     LLM_span.set_status(Status(StatusCode.ERROR, tool_output_contain))
                                     LLM_span.set_attribute("error", True)
                                     LLM_span.set_attribute("error.message", tool_output_contain)
-                            
-                            except Exception as e:
-                                latency_ms = int((time.time() - start_time) * 1000)
-                                tool_output_contain = f"Error: {str(e)}"
-                                self.had_error = True
-                                self.last_error_message = str(e)
-                                self.last_error_mode = "ToolExecutionError"
 
-                                with tracer.start_as_current_span("Failure_ToolExecution") as tool_err_span:
-                                    tool_err_span.set_attribute("openinference.span.kind", "CHAIN")
-                                    tool_err_span.record_exception(e)
-                                    tool_err_span.set_attribute("failure.mode", "ToolExecutionError")
-                                    tool_err_span.set_attribute("error", True)
-                                    tool_err_span.set_attribute("error.message", str(e))
-                                    tool_err_span.set_status(Status(StatusCode.ERROR, str(e)))
-                                LLM_span.record_exception(e)
-                                LLM_span.set_status(Status(StatusCode.ERROR, str(e)))
-                                LLM_span.set_attribute("error", True)
-                                LLM_span.set_attribute("error.message", str(e))
+                                    logger.error(
+                                        "Tool execution failed", 
+                                        extra={
+                                            "tool_name": function_name,
+                                            "status": "error",
+                                            "error_message": tool_output_contain
+                                        }
+                                    )
 
-                                print("\n Logger \n\n")
+                            latency_ms = int((time.time() - start_time) * 1000)
+                            logger.info(
+                                "Tool Execution Complete",
+                                extra={
+                                    "tool_name": function_name,
+                                    "latency_ms": latency_ms,
+                                    "status": "success" if not execution_failed else "error",
+                                    "output_preview": tool_output_contain[:100],
+                                    "self_healed": self.is_healed
+                                }
+                            )
 
-                                logger.error(
-                                    "Tool execution failed", 
-                                    extra={
-                                        "tool_name": function_name,
-                                        "latency_ms": latency_ms,
-                                        "status": "error",
-                                        "error_message": str(e)
-                                    }
-                                )
-
-                        tool_outputs.append(
-                            {
+                            tool_outputs.append({
                                 "tool_call_id": tool_call.id,
                                 "role": "tool",
                                 "name": function_name,
                                 "content": tool_output_contain
-                            }
-                        )
+                            })
+
+                            # 4. Check for loop stagnation after tool execution
+                            if self.self_healing:
+                                stagnation_event = self.observer.observe_loop_stagnation(
+                                    step_count, function_name, function_args, tool_output_contain
+                                )
+                                if stagnation_event:
+                                    healed_loop, intervention_msg, loop_notes = self.remediation.heal_loop_stagnation(stagnation_event)
+                                    if healed_loop:
+                                        self.is_healed = True
+                                        self.healing_log.append(f"Loop breaker: {loop_notes}")
+                                        logger.info(f"Self-Healing loop breaker triggered: {loop_notes}")
+                                        tool_outputs.append(intervention_msg)
 
                     self.messages.extend(tool_outputs)
 
                 else:
                     LLM_span.set_attribute("LLM.final_text_generated", True)
                     LLM_span.set_attribute("output.value", str(response_message.content))
-                    if not self.had_error:
+                    if not self.had_error or self.is_healed:
                         LLM_span.set_status(Status(StatusCode.OK))
 
                     return response_message.content

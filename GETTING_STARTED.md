@@ -77,52 +77,63 @@ python dummyAgent.py
 
 ---
 
-### 5. View Observability Traces
+### 5. View Observability & Self-Healing Traces
 
-When `dummyAgent.py` or `test_suite.py` is running, Arize Phoenix launches a local web UI:
+When `dummyAgent.py`, `self_healing_demo.py`, or `test_suite.py` is running, Arize Phoenix launches a local web UI:
 
 - **Phoenix Dashboard**: [http://localhost:6006](http://localhost:6006)
 
 Here you can inspect:
-- Root spans (`Agent_Workflow`)
+- Root spans (`Agent_Workflow`): marked `Status: OK` with attribute `agent.self_healed: true` upon remediation.
+- Self-Healing Spans:
+  - `SelfHealing_Observation`: Captures anomaly error modes, tool inputs, and stagnation patterns.
+  - `SelfHealing_Analysis`: Root-cause diagnosis and strategy routing.
+  - `SelfHealing_Remediation`: Records the applied recovery tactic, latency, and recovered outputs.
 - Step-by-step LLM completion spans (`LLM_step_1`, `LLM_step_2`, etc.)
-- Tool execution latency and payloads (`tool_fetch_api_data`, `tool_save_summery_file`)
-- Failure modes (`ToolExecutionError`, `SilentValidationError`, `InfiniteLoopError`)
+- Tool execution latency and payloads (`tool_fetch_api_data`, `tool_save_summery_file`, `tool_get_temperature`)
 
 ---
 
-### 6. Run the Failure Mode Test Suite
+### 6. Run the Self-Healing Interactive Demo
 
-To test error handling, placeholder rejection, and loop limits:
+To run side-by-side comparisons (Baseline Failure vs. Self-Healed Success) or run the automated benchmark matrix:
+
+```bash
+python self_healing_demo.py
+```
+
+Demo Options:
+- **`1-4`**: Side-by-side comparison for any scenario:
+  1. *HTTP 404 API Error* -> Healed via `ApiFallbackStrategy`
+  2. *Silent Template Hallucination (`{{...}}`)* -> Healed via `TemplateHydrationStrategy`
+  3. *Infinite Loop & Deadlock* -> Healed via `LoopBreakerStrategy`
+  4. *Unknown Domain Entity (`Atlantis`)* -> Healed via `EntityResolverStrategy`
+- **`A`**: Automated benchmark suite running all 4 scenarios in both modes and displaying a comparison table.
+- **`Q`**: Quit and stop the tracing server.
+
+---
+
+### 7. Run the Failure Mode Test Suite
+
+To run tests with dynamic toggle between Self-Healing mode and Baseline failure mode:
 
 ```bash
 python test_suite.py
 ```
 
-Select a test mode from the interactive prompt (runs repeatedly until you type `q`):
-- **`1` - Tool Execution Failure**: Simulates a 404 REST API endpoint call.
-- **`2` - Silent Template Error**: Tests detection and blocking of `{{fetch_api_data.output.body}}` template syntax.
-- **`3` - Infinite Loop Error**: Tests `max_turns` limit safeguard.
-- **`4` - Unknown City Tool Error**: Tests validation inside domain-specific tools.
-- **`q` - Quit**: Exits the test suite and stops the Phoenix tracing server.
+- Press **`m`** at any time to toggle Self-Healing mode ON/OFF.
+- Select **`1-4`** to execute the corresponding scenario.
 
 ---
 
-## 🛠️ Agent Rules & Workflow
+## 🛠️ Self-Healing Architecture & Rules
 
-The agent operates under strict operational guidelines:
+The agent operates under an automated closed-loop healing framework:
 
-```
-1. Always solve the user request step-by-step using the provided tools.
-2. Sequential Workflow:
-   - Step 1: Call 'fetch_api_data' with the target URL to obtain raw JSON data.
-   - Step 2: Once the tool returns data, summarize the key findings in your reasoning.
-   - Step 3: Call 'save_the_file' with the summarized text and target filename.
-   - Step 4: When information is complete, provide a final concise confirmation message to the user.
-3. CRITICAL: Never generate placeholder templates like '{{variable}}' in tool arguments. All tool arguments must be concrete values.
-4. Do not call 'save_the_file' before 'fetch_api_data' returns data.
-5. If a tool returns an error, examine the error message and attempt an alternative or report the issue clearly.
-```
+1. **Observe**: `HealthObserver` intercepts malformed JSON, unparsed mustache templates, tool exceptions/404s, and cyclic loop stagnation.
+2. **Analyze**: `DiagnosticAnalyzer` diagnoses the root cause, selects the targeted strategy, and logs an OTel diagnosis span.
+3. **Remediate**: `RemediationExecutor` resolves the issue using memory-aware template hydration, canonical URL fallback, fuzzy entity matching, or loop-breaker intervention.
+4. **Trace**: Arize Phoenix records the healing lifecycle and updates the root workflow status from `ERROR` to `SELF_HEALED`.
 
 ---
 
@@ -131,11 +142,26 @@ The agent operates under strict operational guidelines:
 ```
 Dummy-Agent/
 │
-├── dummyAgent.py          # Main agent loop, tool definitions & Phoenix tracing
-├── logger.py              # Structured JSON logger for agent & tool monitoring
-├── test_suite.py          # Interactive test suite for failure modes
-├── requirements.txt       # Python dependencies
-├── .env.local             # Environment variables (API tokens)
-├── post_summary.md        # Sample output file written by the agent
-└── GETTING_STARTED.md     # Setup & usage documentation
+├── self_healing/                 # Modular Self-Healing Framework
+│   ├── __init__.py               # Public API exports
+│   ├── observer.py               # Anomaly, loop, and error event observer
+│   ├── analyzer.py               # Diagnostic classifier & strategy selector
+│   ├── remediation.py            # Closed-loop remediation executor
+│   ├── telemetry.py              # OpenTelemetry spans (Observation, Analysis, Remediation)
+│   ├── llm_fallback.py           # Resilient LLM simulation & infrastructure fallback
+│   └── strategies/               # Recovery strategies
+│       ├── template_hydrator.py  # Resolves {{variable}} from prior context
+│       ├── api_fallback.py       # Reroutes 404s to canonical endpoints & fallbacks
+│       ├── loop_breaker.py       # Detects cycles & injects loop-breaking guidance
+│       ├── entity_resolver.py    # Fuzzy domain entity matcher
+│       └── json_repair.py        # Malformed JSON auto-repair
+│
+├── dummyAgent.py                 # Main agent loop with self_healing toggle & Phoenix tracing
+├── self_healing_demo.py          # Interactive side-by-side demonstration runner
+├── test_suite.py                 # Interactive test suite with healing mode toggle
+├── logger.py                     # Structured JSON logger for agent & tool monitoring
+├── requirements.txt              # Python dependencies
+├── .env.local                    # Environment variables (API tokens)
+├── post_summary.md               # Sample output file written by the agent
+└── GETTING_STARTED.md            # Setup & usage documentation
 ```
