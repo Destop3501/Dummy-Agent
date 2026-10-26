@@ -10,7 +10,6 @@ class EntityResolverStrategy:
 
     name = "EntityFuzzyResolution"
 
-    # Known domain entities for the temperature tool
     KNOWN_CITIES = {
         "san francisco": "75°F (Mild & Clear)",
         "paris": "78°F (Sunny)",
