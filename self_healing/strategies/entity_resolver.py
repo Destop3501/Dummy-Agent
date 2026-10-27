@@ -27,7 +27,6 @@ class EntityResolverStrategy:
         """
         entity_norm = unknown_entity.strip().lower()
 
-        # 1. Check fuzzy match against known entities
         matches = difflib.get_close_matches(entity_norm, cls.KNOWN_CITIES.keys(), n=1, cutoff=0.6)
         if matches:
             best_match = matches[0]
