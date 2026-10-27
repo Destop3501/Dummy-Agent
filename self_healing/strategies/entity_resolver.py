@@ -37,7 +37,6 @@ class EntityResolverStrategy:
                 f"Fuzzy match resolved '{unknown_entity}' to '{best_match}'.",
             )
 
-        # 2. Informative domain fallback
         available_cities = ", ".join(f"{c.title()} ({t})" for c, t in cls.KNOWN_CITIES.items())
         recovery_message = (
             f"Location Notice: '{unknown_entity}' is an unmonitored or fictional location with no active weather station. "
