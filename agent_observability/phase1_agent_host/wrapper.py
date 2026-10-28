@@ -108,7 +108,6 @@ class AgentHostWrapper:
                 max_retries=3,
             )
 
-        # Wrap tools with tracing
         for name, func in self._raw_tools.items():
             self._register_traced_tool(name, func)
 
