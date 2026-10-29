@@ -87,7 +87,6 @@ class AgentHostWrapper:
                 if callable(attr):
                     self._raw_tools[name] = attr
 
-        # Phase 3: Observer Node
         self.evaluator_node = EvaluationNode(
             tool_schemas=self.tool_schemas,
             recovery_router=self._on_detected_failure if self.auto_recover else None,
