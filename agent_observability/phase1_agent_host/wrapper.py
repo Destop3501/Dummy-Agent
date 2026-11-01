@@ -92,7 +92,6 @@ class AgentHostWrapper:
             recovery_router=self._on_detected_failure if self.auto_recover else None,
         )
 
-        # Connect observer node as live listener to traces emitted by Phase 2
         self.collector.add_listener(self.evaluator_node.ingest_trace)
 
         # Phase 4: Self-Healing Recovery Engine
