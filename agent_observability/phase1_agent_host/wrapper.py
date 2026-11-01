@@ -94,7 +94,6 @@ class AgentHostWrapper:
 
         self.collector.add_listener(self.evaluator_node.ingest_trace)
 
-        # Phase 4: Self-Healing Recovery Engine
         if recovery_engine:
             self.recovery_engine = recovery_engine
             if not self.recovery_engine.tool_executor:
@@ -127,7 +126,6 @@ class AgentHostWrapper:
     def _on_detected_failure(self, verdict: EvaluationVerdict, span: ExecutionTraceSpan) -> None:
         """Internal callback invoked when EvaluationNode routes a failed trace."""
         logger.info(f"Observer routed failure for span {span.span_id}. Handing over to Critic.")
-        # Trigger diagnostic loop and recovery
         self.last_recovery_result = self.recovery_engine.handle_failed_trace(
             verdict=verdict,
             span=span,
