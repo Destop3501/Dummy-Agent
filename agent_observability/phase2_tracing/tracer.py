@@ -69,7 +69,6 @@ class TraceCollector:
             self._traces.clear()
 
 
-# Global default collector
 default_collector = TraceCollector()
 
 
