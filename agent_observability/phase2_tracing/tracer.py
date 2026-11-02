@@ -35,7 +35,6 @@ class TraceCollector:
         with self._lock:
             self._traces.append(span)
 
-        # Notify any subscribed observers (e.g. Phase 3 evaluator)
         for listener in list(self._listeners):
             try:
                 listener(span)
