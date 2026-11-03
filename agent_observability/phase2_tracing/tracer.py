@@ -143,7 +143,6 @@ def trace_tool(
             parent_id = _CURRENT_SPAN_ID.get()
             current_trace = _CURRENT_TRACE_ID.get()
 
-            # Normalize inputs into dictionary for structured telemetry
             sig = inspect.signature(func)
             bound_args = sig.bind_partial(*args, **kwargs)
             bound_args.apply_defaults()
