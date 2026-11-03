@@ -102,7 +102,6 @@ def trace_prompt(
                 name=op_name,
                 inputs={"args": [str(a) for a in args], "kwargs": {k: str(v) for k, v in kwargs.items()}},
             )
-            # Bind trace context
             trace_token = _CURRENT_TRACE_ID.set(span.trace_id)
             span_token = _CURRENT_SPAN_ID.set(span.span_id)
 
