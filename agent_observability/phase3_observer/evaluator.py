@@ -100,7 +100,6 @@ class EvaluationNode:
             err_msg = err.message.lower() if err else ""
             err_type = err.error_type if err else ""
 
-            # Detect API rejections (HTTP 4xx, 5xx, connection refused, unauthorized)
             api_keywords = ["404", "500", "403", "401", "400", "http", "api", "connection refused", "timeout", "rejected"]
             if any(k in err_msg for k in api_keywords) or "HTTPError" in err_type:
                 return EvaluationVerdict(
