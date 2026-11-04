@@ -95,7 +95,6 @@ class EvaluationNode:
         schema = self.tool_schemas.get(tool_name)
         deviations: List[str] = []
 
-        # 1. Check for caught runtime exceptions or API rejections
         if span.status == SpanStatus.FAILED or span.error is not None:
             err = span.error
             err_msg = err.message.lower() if err else ""
